@@ -15,7 +15,7 @@ Optional env override:
 
 ## Pages
 1. **Submit Purchase Request** (CFOs): submit with real-time budget remaining + budget enforcement.
-2. **Admin Dashboard** (Dorothy & Liao): filter + approve/reject with one click; budget summary per team.
+2. **Admin and professor Dashboard ** (Dorothy & Luyao): filter + approve/reject with one click; budget summary per team.
 3. **Received Confirmation**: mark approved orders as received; optional return flag/reason.
 4. **Summary & Export**: totals per team + CSV export + archived history view.
 
