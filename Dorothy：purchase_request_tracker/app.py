@@ -19,6 +19,9 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 
+import altair as alt
+import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -77,7 +80,10 @@ from prt.statuses import (
     STATUS_WITHDRAWN,
 )
 from prt.ui import (
+    UW_PURPLE,
     _admin_awaiting_admin_review,
+    _local_week_start_end,
+    _parse_order_created_local,
     hr_divider,
     inject_prt_styles,
     render_sidebar,
@@ -1920,6 +1926,173 @@ def _admin_budget_summary_display_rows(budget_summary: list[dict[str, Any]]) -> 
     return out
 
 
+def _admin_pending_orders_this_week_count(orders: list[Any]) -> int:
+    """Orders created this calendar week (local) that are not yet approved or rejected."""
+    w0, w1 = _local_week_start_end()
+    n = 0
+    for o in orders:
+        dt = _parse_order_created_local(o)
+        if dt is None or not (w0 <= dt < w1):
+            continue
+        stt = str(o["status"]) if "status" in o.keys() else ""
+        if stt in (STATUS_APPROVED, STATUS_REJECTED):
+            continue
+        n += 1
+    return n
+
+
+def _admin_class_budget_totals(class_id: int) -> tuple[float, float, float]:
+    """Sum of per-team budgets, used, and remaining for the class."""
+    rows = get_budget_summary_by_team(class_id)
+    if not rows:
+        return 0.0, 0.0, 0.0
+    total_b = sum(float(r["budget_total"]) for r in rows)
+    used = sum(float(r["used_amount"]) for r in rows)
+    remaining = sum(float(r["remaining_amount"]) for r in rows)
+    return total_b, used, remaining
+
+
+def _admin_created_sort_ts(o: Any) -> float:
+    dt = _parse_order_created_local(o)
+    if dt is not None:
+        return dt.timestamp()
+    return 0.0
+
+
+def _admin_budget_usage_chart(budget_summary: list[dict[str, Any]]) -> alt.Chart:
+    """Stacked bar: approved spend vs remaining budget per team (UW purple theme)."""
+    rows: list[dict[str, Any]] = []
+    for r in budget_summary:
+        tn = str(r["team_number"])
+        rows.append(
+            {
+                "Team": tn,
+                "Segment": "Approved spend",
+                "Dollars": float(r["used_amount"]),
+            }
+        )
+        rows.append(
+            {
+                "Team": tn,
+                "Segment": "Remaining",
+                "Dollars": float(r["remaining_amount"]),
+            }
+        )
+    df = pd.DataFrame(rows)
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X("Team:N", title="Team / student group", sort=None),
+            y=alt.Y("Dollars:Q", title="Dollars ($)", stack="zero"),
+            color=alt.Color(
+                "Segment:N",
+                title="",
+                scale=alt.Scale(
+                    domain=["Approved spend", "Remaining"],
+                    range=["#4b2e83", "#e8e0f2"],
+                ),
+            ),
+            order=alt.Order("Segment:N", sort="ascending"),
+            tooltip=[
+                "Team",
+                "Segment",
+                alt.Tooltip("Dollars:Q", format="$,.2f", title="Amount"),
+            ],
+        )
+        .properties(height=340)
+        .configure_axis(labelFontSize=12, titleFontSize=13)
+        .configure_legend(labelFontSize=12)
+    )
+
+
+def _visible_admin_order_signatures(
+    orders: list[Any],
+) -> tuple[tuple[int, str, str, str, float], ...]:
+    """Hashable snapshot of dashboard-visible orders for st.cache_data aggregation."""
+    vis = [o for o in orders if _admin_order_visible_for_dashboard(o)]
+    out: list[tuple[int, str, str, str, float]] = []
+    for o in sorted(vis, key=lambda x: int(x["id"])):
+        wl_raw = o["window_label"] if "window_label" in o.keys() else None
+        wl = str(wl_raw).strip() if wl_raw is not None else ""
+        stt = str(o["status"]) if "status" in o.keys() else ""
+        raw = o["team_number_snapshot"] if "team_number_snapshot" in o.keys() else None
+        tn = (str(raw).strip() if raw is not None else "") or "—"
+        try:
+            price = float(o["total_price"] or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        out.append((int(o["id"]), wl, stt, tn, price))
+    return tuple(out)
+
+
+@st.cache_data(show_spinner=False)
+def _query_approved_spend_by_team_for_window(
+    window_label: str,
+    order_signatures: tuple[tuple[int, str, str, str, float], ...],
+) -> list[tuple[str, float]]:
+    """Approved order totals per team for the given submission window label."""
+    target = window_label.strip()
+    if not target:
+        return []
+    spend: dict[str, float] = defaultdict(float)
+    for _oid, wl, stt, tn, price in order_signatures:
+        if wl != target:
+            continue
+        if stt != STATUS_APPROVED:
+            continue
+        spend[tn] += price
+    teams_sorted = sorted(spend.keys(), key=lambda x: (x == "—", x))
+    return [(t, spend[t]) for t in teams_sorted]
+
+
+def _admin_window_team_spend_figure(team_amounts: list[tuple[str, float]]) -> go.Figure:
+    """Bar chart: approved spend per team for the current submission window."""
+    teams_sorted = [t for t, _ in team_amounts]
+    amounts = [a for _, a in team_amounts]
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=teams_sorted,
+                y=amounts,
+                marker_color="#4b2e83",
+                hovertemplate="%{x}<br>Amount: $%{y:,.2f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Weekly Spending by Team",
+        xaxis_title="Team / class name",
+        yaxis_title="Amount (USD)",
+        height=380,
+        margin=dict(l=48, r=24, t=56, b=48),
+        showlegend=False,
+        template="plotly_white",
+        yaxis=dict(rangemode="tozero"),
+    )
+    return fig
+
+
+def _render_admin_current_window_team_spend_chart(
+    orders: list[Any],
+    window_label: str | None,
+) -> None:
+    """Plotly bar chart below the approval table for the active submission window."""
+    if not window_label or not str(window_label).strip():
+        return
+    wl = str(window_label).strip()
+    sig = _visible_admin_order_signatures(orders)
+    buckets = _query_approved_spend_by_team_for_window(wl, sig)
+    if not buckets:
+        st.info("No approved orders this week.")
+        return
+    st.plotly_chart(
+        _admin_window_team_spend_figure(buckets),
+        use_container_width=True,
+        key="prt_admin_weekly_team_spend",
+    )
+
+
 def _admin_scroll_to_anchor_script(anchor_id: str) -> None:
     """Scroll main document to an element id (Admin Dashboard jump control)."""
     components.html(
@@ -2430,6 +2603,107 @@ def _render_admin_orders_table(
                             st.rerun()
 
 
+def render_admin_overview() -> None:
+    """First-stop summary for Dorothy: weekly pending, class budget, final-approval queue."""
+    section_header(
+        "Overview",
+        "At-a-glance summary for the selected class — pending work this week, budget, and your approval queue.",
+    )
+    hr_divider()
+
+    active_class_id = st.session_state.active_class_id
+    try:
+        orders = list_orders(
+            class_id=active_class_id,
+            team_number=None,
+            status=None,
+            provider_name=None,
+            deadline_start=None,
+            deadline_end=None,
+            window_label=None,
+        )
+    except Exception:
+        orders = []
+
+    orders = [o for o in orders if _admin_order_visible_for_dashboard(o)]
+    admin_pt = get_class_project_type(int(active_class_id))
+
+    pending_week = _admin_pending_orders_this_week_count(orders)
+    total_budget, total_used, total_remaining = _admin_class_budget_totals(int(active_class_id))
+
+    st.markdown(
+        f"""
+<style>
+section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(.prt-admin-overview-anchor)
+  div[data-testid="column"] [data-testid="stMetricValue"] {{
+  color: {UW_PURPLE} !important;
+  font-weight: 700 !important;
+}}
+section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(.prt-admin-overview-anchor)
+  div[data-testid="column"] [data-testid="stMetricLabel"] p {{
+  color: #4b5563 !important;
+}}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<span class="prt-admin-overview-anchor" style="display:none"></span>',
+        unsafe_allow_html=True,
+    )
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Pending orders (this week)", pending_week)
+    with m2:
+        st.metric("Budget used (all teams)", f"${total_used:,.2f}")
+    with m3:
+        st.metric("Budget remaining (all teams)", f"${total_remaining:,.2f}")
+
+    st.caption(
+        f"Total allocated across teams: **${total_budget:,.2f}** "
+        f"({100.0 * total_used / total_budget:.0f}% used)"
+        if total_budget > 0
+        else "No team budgets configured for this class yet."
+    )
+
+    hr_divider()
+    st.markdown(
+        f'<h3 style="color:{UW_PURPLE};font-size:1.15rem;font-weight:700;margin:0 0 0.75rem 0;">'
+        f"Awaiting your final approval</h3>",
+        unsafe_allow_html=True,
+    )
+
+    queue = [o for o in orders if _admin_awaiting_admin_review(o)]
+    queue.sort(key=_admin_created_sort_ts, reverse=True)
+
+    if not queue:
+        st.success("No orders are waiting for your final approval right now.")
+        return
+
+    for o in queue:
+        oid = int(o["id"])
+        party = _order_party_display_label(
+            admin_pt,
+            o["team_number_snapshot"] if "team_number_snapshot" in o.keys() else None,
+            o["cfo_name_snapshot"] if "cfo_name_snapshot" in o.keys() else None,
+        )
+        item = html.escape(str(o["item_name"] or ""))
+        try:
+            amt = float(o["total_price"] or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        sub = _parse_order_created_local(o)
+        sub_s = sub.strftime("%b %d, %Y") if sub else "—"
+        with st.container(border=True):
+            st.markdown(
+                f"**#{oid}** — {item}  \n"
+                f"<span style='color:#6b7280;font-size:0.9rem'>{html.escape(party)} · "
+                f"${amt:,.2f} · submitted {html.escape(sub_s)}</span>",
+                unsafe_allow_html=True,
+            )
+
+
 def render_admin_dashboard() -> None:
     if st.session_state.pop("prt_email_toast", False):
         st.toast(EMAIL_FAIL_TOAST, icon="⚠️")
@@ -2469,6 +2743,11 @@ def render_admin_dashboard() -> None:
     current_label = _admin_resolve_current_window_label(int(active_class_id))
     metrics = _admin_current_window_metrics(orders, current_label)
 
+    try:
+        budget_summary = get_budget_summary_by_team(int(active_class_id))
+    except Exception:
+        budget_summary = []
+
     pnd = int(metrics["pending"])
     st.markdown(
         f"""
@@ -2495,11 +2774,12 @@ section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(.prt-admi
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
+        st.metric("📋 This Week's Orders", metrics["total"])
+        # Anchor after the metric so the markdown block does not push this column down vs m2–m4.
         st.markdown(
             '<span class="prt-admin-metrics-anchor" style="display:none"></span>',
             unsafe_allow_html=True,
         )
-        st.metric("📋 This Week's Orders", metrics["total"])
     with m2:
         st.metric(
             "⚠️ Pending Approval" if pnd > 0 else "Pending Approval",
@@ -2512,6 +2792,18 @@ section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(.prt-admi
 
     if st.button("Jump to this week ↓", type="primary", key="prt_admin_jump_week"):
         st.session_state["_prt_admin_scroll_week"] = True
+
+    st.markdown(
+        f'<p class="prt-section-desc" style="margin:1rem 0 0.5rem 0;">'
+        f"<strong style='color:{UW_PURPLE};'>Budget vs. approved spend</strong> — per team (stacked)</p>",
+        unsafe_allow_html=True,
+    )
+    if budget_summary:
+        st.altair_chart(_admin_budget_usage_chart(budget_summary), use_container_width=True)
+    else:
+        st.caption("No team budgets to chart for this class yet.")
+
+    hr_divider()
 
     with st.expander("⚙️ Manage Submission Windows (click to expand)", expanded=False):
         st.markdown("##### Submission Windows")
@@ -2676,7 +2968,6 @@ section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(.prt-admi
 
     hr_divider()
 
-    budget_summary = get_budget_summary_by_team(active_class_id)
     budget_display = _admin_budget_summary_display_rows(budget_summary)
     with st.expander("Budget summary per team", expanded=False):
         st.dataframe(budget_display, use_container_width=True)
@@ -2730,6 +3021,7 @@ section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(.prt-admi
         anchor_done = True
         st.markdown(f"**{html.escape(current_label)}**")
         st.caption("No orders for this submission window yet.")
+        _render_admin_current_window_team_spend_chart(orders, current_label)
         csv_bytes = _admin_orders_to_csv_bytes([], class_name_export)
         st.download_button(
             label="📥 Export this week as CSV",
@@ -2753,6 +3045,7 @@ section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(.prt-admi
         st.markdown(f"**{win_label}**")
         _render_admin_orders_table(win_orders, f"adm_wk_{idx}", admin_pt)
         if match_current:
+            _render_admin_current_window_team_spend_chart(orders, current_label)
             csv_b = _admin_orders_to_csv_bytes(win_orders, class_name_export)
             st.download_button(
                 label="📥 Export this week as CSV",
@@ -3086,7 +3379,11 @@ elif role == ROLE_INSTRUCTOR:
     with tab_ins:
         render_instructor_page()
 elif role == ROLE_ADMIN:
-    tab_admin, tab_summary = st.tabs(["Admin Dashboard", "Summary & Report"])
+    tab_overview, tab_admin, tab_summary = st.tabs(
+        ["Overview", "Admin Dashboard", "Summary & Report"]
+    )
+    with tab_overview:
+        render_admin_overview()
     with tab_admin:
         render_admin_dashboard()
     with tab_summary:

@@ -1,0 +1,38 @@
+# Project: Purchase Request Tracker
+# Framework: Streamlit (Python)
+# Python version: 3.11+
+
+## Project Context
+This is a web app for GIX (University of Washington) to manage
+purchase requests. Three user roles: Student (CFO), Instructor,
+and Admin (Dorothy). Built with Streamlit + SQLite.
+
+## Coding Standards
+- Use Python 3.11+ features and type hints on all functions
+- Add Google-style docstrings to all functions
+- Use descriptive variable names (no single-letter names)
+- Keep functions under 30 lines; extract helpers when needed
+- Never hardcode sensitive data (API keys, passwords)
+
+## Streamlit Conventions
+- Use st.set_page_config() at the top of the main file
+- Use st.cache_data for all database query functions
+- Handle errors with try/except and show st.error() or st.warning()
+- Never let the app crash on invalid user input
+
+## UI & Branding
+- UW purple theme: primary color #4b2e83
+- Use st.metric() for all dashboard statistics
+- Use Plotly (not Matplotlib or Altair) for all charts
+- Always include chart titles, axis labels, and hover tooltips
+- If data is empty, show st.info() with a friendly message
+  instead of an empty chart
+
+## Database
+- SQLite with permanent storage (never delete, only archive)
+- Always use parameterized queries to prevent SQL injection
+- Row objects must be accessed with row["column"] not row.get()
+
+## File Structure
+- app.py: Main Streamlit application (single-file architecture)
+- purchases.db: SQLite database
